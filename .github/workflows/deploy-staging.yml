@@ -1,0 +1,152 @@
+name: Deploy staging
+# Publishes the shannon-ops-review `staging` branch to a preview URL.
+#
+# Why this lives in its own repository: GitHub Pages serves one site per repo,
+# and the dashboard's Pages site is built by a workflow on its main branch.
+# Deploying a second branch from there would replace the live site - the one the
+# client reads assets/pipeline-truth.json from. Building here means a broken
+# staging build cannot reach production at all: nothing in this repository has
+# write access to the other one, and nothing in the other one triggers this.
+#
+# Code and data are taken from different refs on purpose:
+#
+#   code   the ref being previewed (staging by default)
+#   data   whatever is on main right now, copied once per run
+#
+# So a run is a SNAPSHOT: the figures are frozen at the moment you deploy, and
+# stay put until you deploy again. That is what makes a before/after comparison
+# mean anything - the data is not moving under the change you are looking at.
+# Run this workflow again to take a fresh snapshot.
+#
+# Reads two public refs over https and writes nothing back. No credentials, no
+# bucket access, no VM.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch or SHA of shannon-ops-review to preview'
+        required: false
+        default: 'staging'
+      data_ref:
+        description: 'Ref to take the data snapshot from'
+        required: false
+        default: 'main'
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: staging-pages
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: https://github.com/rahuls17-cell/shannon-ops-review.git
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Fetch the code and the data snapshot
+        run: |
+          CODE_REF="${{ github.event.inputs.ref || 'staging' }}"
+          DATA_REF="${{ github.event.inputs.data_ref || 'main' }}"
+          echo "code from $CODE_REF, data from $DATA_REF"
+          git clone --no-checkout --filter=blob:none "$SOURCE_REPO" src
+          cd src
+          # Shallow on both refs: the history of this repository is large and
+          # none of it is needed to publish one commit of it.
+          git fetch --depth 1 origin "$CODE_REF" "$DATA_REF"
+          git checkout -q FETCH_HEAD -- . 2>/dev/null || true
+          git checkout -q "origin/$CODE_REF" 2>/dev/null || git checkout -q "$CODE_REF"
+          # The data is taken from its own ref, replacing whatever assets the
+          # code ref happened to carry.
+          rm -rf assets
+          git checkout "origin/$DATA_REF" -- assets
+          echo "CODE_SHA=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "DATA_SHA=$(git rev-parse --short "origin/$DATA_REF")" >> "$GITHUB_ENV"
+          echo "CODE_REF=$CODE_REF" >> "$GITHUB_ENV"
+
+      - name: Assemble the site
+        run: |
+          mkdir -p _site
+          cd src
+          cp index.html ../_site/
+          cp -r assets ../_site/
+          # The script and stylesheet list is read off index.html rather than
+          # written out here, the same way the production deploy does it: a
+          # hand-kept second copy of that list is a second thing to drift.
+          python3 - <<'COPY'
+          import pathlib, re, shutil
+          html = pathlib.Path('index.html').read_text(encoding='utf-8')
+          site = pathlib.Path('../_site')
+          refs = re.findall(r'(?:src|href)="([^"]+\.(?:js|css))"', html)
+          local = [r for r in dict.fromkeys(refs)
+                   if not r.startswith(('http://', 'https://', '//', 'data:'))]
+          missing = [r for r in local if not pathlib.Path(r).exists()]
+          if missing:
+              raise SystemExit(f'index.html references files that are not here: {missing}')
+          for ref in local:
+              target = site / ref
+              target.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copy(ref, target)
+          print(f'copied {len(local)} scripts and stylesheets')
+          COPY
+
+      - name: Mark it as staging
+        # Two jobs: stop it being indexed, and stop a screenshot of it being
+        # mistaken for the real dashboard. The banner is injected at build time
+        # so the staging branch stays a clean copy of main - a banner committed
+        # to the branch would eventually be merged into production.
+        run: |
+          python3 - <<'MARK'
+          import os, pathlib
+          site = pathlib.Path('_site')
+          html = (site / 'index.html').read_text(encoding='utf-8')
+          code_ref, code_sha = os.environ['CODE_REF'], os.environ['CODE_SHA']
+          data_sha = os.environ['DATA_SHA']
+          banner = f'''<div id="stagingBanner" role="status">STAGING &middot; not the live dashboard
+            &middot; code <code>{code_ref}@{code_sha}</code>
+            &middot; data snapshot <code>main@{data_sha}</code>
+            &middot; <a href="https://rahuls17-cell.github.io/shannon-ops-review/">go to the live one</a></div>
+          <style>
+            #stagingBanner {{
+              position: sticky; top: 0; z-index: 9999;
+              padding: 7px 14px;
+              background: #7c2d12; color: #fff;
+              font: 600 12px/1.45 ui-sans-serif, system-ui, sans-serif;
+              text-align: center; letter-spacing: .01em;
+            }}
+            #stagingBanner code {{ font-weight: 500; opacity: .85; }}
+            #stagingBanner a {{ color: #fff; }}
+          </style>'''
+          if '<meta name="robots"' not in html:
+              html = html.replace('<head>', '<head>\n  <meta name="robots" content="noindex, nofollow">', 1)
+          marker = html.index('<body')
+          marker = html.index('>', marker) + 1
+          html = html[:marker] + '\n' + banner + html[marker:]
+          (site / 'index.html').write_text(html, encoding='utf-8')
+          # Belt and braces: a robots.txt as well, since the meta tag only
+          # covers the page and not the assets beside it.
+          (site / 'robots.txt').write_text('User-agent: *\nDisallow: /\n', encoding='utf-8')
+          print('banner and noindex applied')
+          MARK
+
+      - name: What is being published
+        run: |
+          echo "code  ${CODE_REF}@${CODE_SHA}"
+          echo "data  main@${DATA_SHA}"
+          du -sh _site
+          ls _site | head
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v4
